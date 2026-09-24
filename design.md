@@ -99,6 +99,7 @@ A vault entry contains the following fields:
 | `service_name` | Name of the service |
 | `password` | Stored password |
 | `notes` | Optional notes about the entry |
+
 This plaintext data exists only in memory while the vault is unlocked. It is
 never stored directly on disk. The stored vault will contain encrypted data together with the metadata
 required for decryption, such as the format version and encryption nonce.
