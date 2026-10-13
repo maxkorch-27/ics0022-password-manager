@@ -9,3 +9,8 @@
 /dataSources/
 /dataSources.local.xml
 .idea/
+
+data/
+.venv/
+__pycache__/
+*.pyc

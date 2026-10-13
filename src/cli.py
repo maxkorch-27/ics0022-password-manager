@@ -1,7 +1,6 @@
 import getpass
 import sys
-
-MAX_COMMAND_LENGTH = 64
+from src.accounts import AccountExistsError, authenticate_user, initialize_storage, register_user
 
 HELP_TEXT = """
 Available commands:
@@ -19,30 +18,36 @@ unlock - Unlock the current vault
 exit - Exit the application
 """
 
+def read_bounded_line(prompt, length):
+    print(prompt, end="", flush=True)
+    line = sys.stdin.readline(length+2)
+    if line == "":
+        raise EOFError
+    if len(line.rstrip("\r\n")) > length:
+        while line and not line.endswith("\n"):
+            line = sys.stdin.readline(4096)
+        raise ValueError("Input is too long")
+    return line.strip()
+
+
 class PasswordManagerCLI:
     def __init__(self):
         self.current_user = None
-        self.vault_locked = True
+        self.vault_key = None
         self.running = True
 
     def run(self):
-        print("PASSWORD MANAGER")
+        print('PASSWORD MANAGER')
         print("Type 'help' to see available commands")
         while self.running:
             try:
-                print("pm> ", end="", flush=True)
-                command = sys.stdin.readline(MAX_COMMAND_LENGTH + 2)
-                if command == "":
-                    raise EOFError
-                if len(command.rstrip("\r\n")) > MAX_COMMAND_LENGTH:
-                    while command and not command.endswith("\n"):
-                        command = sys.stdin.readline(4096)
-                    print("Command is too long")
-                    continue
-                self.handle_command(command.strip().lower())
+                command = read_bounded_line('pm> ', 64).lower()
+                self.handle_command(command)
+            except ValueError as exc:
+                print(exc)
             except (KeyboardInterrupt, EOFError):
-                print("\nExiting Password Manager")
-                self.running = False
+                print()
+                self.exit_app()
 
     def handle_command(self, command):
         if not command:
@@ -71,15 +76,50 @@ class PasswordManagerCLI:
         print(HELP_TEXT)
 
     def register(self):
-        print("Registration logic to be added")
+        if self.current_user is not None:
+            print("Log out before registering another user.")
+            return
+
+        username = read_bounded_line("Username: ", 32).lower()
+        password = getpass.getpass("Master password: ")
+        confirmation = getpass.getpass("Confirm master password: ")
+        if password != confirmation:
+            print("Passwords do not match.")
+            return
+        try:
+            register_user(username, password)
+        except (AccountExistsError, ValueError) as exc:
+            print(f"Registration failed: {exc}")
+            return
+        print("Account successfully created.")
+        #TOTP logic to be added
 
     def login(self):
-        print("Login logic to be added")
+        if self.current_user is not None:
+            print("Already logged in. Log out first.")
+            return
+        username = read_bounded_line("Username: ", 32).lower()
+        password = getpass.getpass("Master password: ")
+        try:
+            dek = authenticate_user(username, password)
+        except RuntimeError as exc:
+            print(f"Login failed: {exc}")
+            return
+        if dek is None:
+            print("Invalid username or master password.")
+            return
+
+        self.current_user = username
+        self.vault_key = dek
+        print(f"Logged in as {username}. Vault unlocked.")
 
     def logout(self):
         if self.current_user is None:
             print("No user is currently logged in.")
             return
+        self.vault_key = None
+        self.current_user = None
+        print("Logged out. Vault locked.")
 
         self.current_user = None
         print("Logged out.")
@@ -101,23 +141,41 @@ class PasswordManagerCLI:
 
     def lock_vault(self):
         if self.current_user is None:
-            print("No vault is currently unlocked.")
+            print("Log in first to lock vault.")
             return
-        self.vault_locked = True
-        print("Vault locked.")
+        elif self.vault_key is None:
+            print("Vault is already locked.")
+        else:
+            self.vault_key = None
+            print("Vault locked.")
 
     def unlock_vault(self):
         if self.current_user is None:
-            print("No vault is currently locked.")
+            print("Log in first to unlock vault.")
             return
-        self.vault_locked = False
-        print ("Vault unlocked logic to be added")
+        if self.vault_key is not None:
+            print("Vault is already unlocked.")
+            return
+        password = getpass.getpass("Master password: ")
+        try:
+            dek = authenticate_user(self.current_user, password)
+        except RuntimeError as exc:
+            print("Unlock failed: {exc}")
+            return
+        if dek is None:
+            print("Invalid master password.")
+            return
+        self.vault_key = dek
+        print("Vault unlocked.")
 
     def exit_app(self):
+        self.vault_key = None
+        self.current_user = None
         self.running = False
         print("Exiting Password Manager")
 
 def main():
+    initialize_storage()
     app = PasswordManagerCLI()
     app.run()
 
