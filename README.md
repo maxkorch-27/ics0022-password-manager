@@ -41,6 +41,7 @@ commands:
 | `login` | Authenticate a user using their username, master password, and TOTP code |
 | `logout` | End the current user session |
 | `lock` | Lock the currently unlocked vault |
+|`unlock`| Unlock the currently locked vault |
 | `add` | Add a new password entry |
 | `edit` | Edit an existing password entry |
 | `remove` | Remove a password entry |
