@@ -50,6 +50,45 @@ def load_vault(username, dek):
 
     return document, user_id
 
+def save_vault(document, user_id, dek):
+    vault_path = VAULT_DIR / f"{user_id}.vault"
+    aad = b"pm-vault-v1:" + user_id.encode("utf-8")
+    plaintext = json.dumps(
+        document,
+        ensure_ascii=False,
+        separators=(",", ":")
+    ).encode("utf-8")
+    nonce = secrets.token_bytes(12)
+
+    encrypted = nonce + AESGCM(dek).encrypt(
+        nonce,
+        plaintext,
+        aad
+    )
+
+    if len(encrypted) > MAX_VAULT_BYTES:
+        raise VaultError("Invalid vault size.")
+    tmp_path = None
+    try:
+        fd, tmp_name = tempfile.mkstemp(
+            dir=VAULT_DIR,
+            prefix=f".{user_id}.",
+            suffix=".tmp"
+        )
+
+        tmp_path = Path(tmp_name)
+        with os.fdopen(fd, "wb") as f:
+            f.write(encrypted)
+            f.flush()
+            os.fsync(f.fileno())
+
+        os.replace(tmp_path, vault_path)
+    except OSError as exc:
+        raise VaultError("Failed to save the encrypted vault.") from exc
+    finally:
+        if tmp_path is not None:
+            tmp_path.unlink(missing_ok=True)
+
 def add_entry(username, dek, service_name, password, notes):
     if not 1 <= len(service_name) <= 100 or not service_name.strip():
         raise ValueError("Service name must be 1-100 characters.")
@@ -77,41 +116,7 @@ def add_entry(username, dek, service_name, password, notes):
         "password": password,
         "notes": notes,
     })
-    new_plaintext = json.dumps(
-        document,
-        ensure_ascii=False,
-        separators=(",", ":")
-    ).encode("utf-8")
-    new_nonce = secrets.token_bytes(12)
-    aad = b"pm-vault-v1:" + user_id.encode("utf-8")
-    encrypted = new_nonce + AESGCM(dek).encrypt(
-        new_nonce,
-        new_plaintext,
-        aad
-    )
-    if len(encrypted) > MAX_VAULT_BYTES:
-        raise VaultError("Invalid vault size.")
-    vault_path = VAULT_DIR / f"{user_id}.vault"
-    tmp_path = None
-    try:
-        fd, tmp_name = tempfile.mkstemp(
-            dir=VAULT_DIR,
-            prefix=f".{user_id}.",
-            suffix=".tmp"
-        )
-
-        tmp_path = Path(tmp_name)
-        with os.fdopen(fd, "wb") as f:
-            f.write(encrypted)
-            f.flush()
-            os.fsync(f.fileno())
-
-        os.replace(tmp_path, vault_path)
-    except OSError as exc:
-        raise VaultError("Failed to save the encrypted vault.") from exc
-    finally:
-        if tmp_path is not None:
-            tmp_path.unlink(missing_ok=True)
+    save_vault(document, user_id, dek)
     return entry_id
 
 def list_entries(username, dek):
@@ -160,3 +165,63 @@ def find_entry(username, dek, service_name):
                 "notes": entry["notes"]
             }
     raise VaultError("Entry not found.")
+
+def edit_entry(username, dek, service_name, new_service_name=None, new_password=None, new_notes=None):
+    document, user_id = load_vault(username, dek)
+    normalized_name = service_name.strip().casefold()
+    target_entry = None
+    for entry in document["entries"]:
+        if (
+            not isinstance(entry, dict)
+            or not isinstance(entry.get("service_name"), str)
+            or not isinstance(entry.get("password"), str)
+            or not isinstance(entry.get("notes"), str)
+        ):
+            raise VaultError("Vault entry format is invalid.")
+        if entry["service_name"].strip().casefold() == normalized_name:
+            target_entry = entry
+            break
+    if target_entry is None:
+        raise VaultError("Entry not found.")
+    if new_service_name is not None:
+        new_service_name = new_service_name.strip().casefold()
+        if not 1 <= len(new_service_name) <= 100:
+            raise ValueError("New service name must be 1-100 characters.")
+        for entry in document["entries"]:
+            if entry is target_entry:
+                continue
+            if entry["service_name"].strip().casefold() == new_service_name.casefold():
+                raise VaultError("Service name already exists.")
+        target_entry["service_name"] = new_service_name
+    if new_password is not None:
+        if not 1 <= len(new_password) <= 256:
+            raise ValueError("New password must be 1-256 characters.")
+        target_entry["password"] = new_password
+    if new_notes is not None:
+        if len(new_notes) > 1000:
+            raise ValueError("New notes must be at most 1000 characters.")
+        target_entry["notes"] = new_notes
+    if all(value is None for value in (
+            new_service_name, new_password, new_notes)):
+        return False
+    save_vault(document, user_id, dek)
+    return True
+
+def remove_entry(username, dek, service_name):
+    document, user_id = load_vault(username, dek)
+    normalized_name = service_name.strip().casefold()
+    target_index = None
+
+    for index, entry in enumerate(document["entries"]):
+        if (
+            not isinstance(entry, dict)
+            or not isinstance(entry.get("service_name"), str)
+        ):
+            raise VaultError("Vault entry format is invalid.")
+        if entry["service_name"].strip().casefold() == normalized_name:
+            target_index = index
+            break
+    if target_index is None:
+        raise VaultError("Entry not found.")
+    document["entries"].pop(target_index)
+    save_vault(document, user_id, dek)

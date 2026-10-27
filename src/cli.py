@@ -5,7 +5,7 @@ import shutil
 import subprocess
 from src.accounts import AccountExistsError, authenticate_user, initialize_storage, register_user
 from src.vault import (VaultError, add_entry as save_entry, list_entries as get_entries, get_entry_password,
-                       find_entry as search_entry)
+                       find_entry as search_entry, edit_entry as update_entry, remove_entry as delete_entry)
 
 HELP_TEXT = """
 Available commands:
@@ -252,10 +252,70 @@ class PasswordManagerCLI:
         print("Password: Use 'copy' command to access password.")
 
     def edit_entry(self):
-        print("Editing logic to be added")
+        if self.current_user is None:
+            print("Please log in first.")
+            return
+        if self.vault_key is None:
+            print("Vault is locked. Use unlock first.")
+            return
+
+        service_name = read_bounded_line("Service name to edit: ", 100)
+        if not service_name or not service_name.strip():
+            print("Service name cannot be empty.")
+            return
+        new_service_name = read_bounded_line("New service name (Enter to keep): ", 100)
+        if not new_service_name: new_service_name = None
+
+        new_password = getpass.getpass("New password (Enter to keep): ")
+        if not new_password:
+            new_password = None
+        else:
+            confirm_password = getpass.getpass(
+                "Confirm new password: "
+            )
+            if new_password != confirm_password:
+                print("Passwords do not match.")
+                return
+        new_notes = read_bounded_line("New notes (Enter to keep, '/clear' to remove): ", 1000)
+        if new_notes=="": new_notes = None
+        elif new_notes == "/clear":
+            new_notes = ""
+        try:
+            changed = update_entry(self.current_user, self.vault_key, service_name, new_service_name, new_password, new_notes)
+        except (ValueError, VaultError) as exc:
+            print(f"Failed to edit entry: {exc}")
+            return
+        if changed:
+            print("Entry updated successfully.")
+        else:
+            print("No changes made.")
+
 
     def remove_entry(self):
-        print("Removing logic to be added")
+        if self.current_user is None:
+            print("Please log in first.")
+            return
+        if self.vault_key is None:
+            print("Vault is locked. Use unlock first.")
+            return
+
+        service_name = read_bounded_line("Service name to remove: ", 100)
+        if not service_name or not service_name.strip():
+            print("Service name cannot be empty.")
+            return
+        confirmation = read_bounded_line(
+            f"Are you sure you want to remove {service_name!r}? (yes/no): ",
+            3
+        )
+        if confirmation.strip().casefold() != "yes":
+            print("Removal cancelled.")
+            return
+        try:
+            delete_entry(self.current_user, self.vault_key, service_name)
+        except (VaultError, ValueError) as exc:
+            print(f"Failed to remove entry: {exc}")
+            return
+        print("Removal successful.")
 
     def lock_vault(self):
         if self.current_user is None:
