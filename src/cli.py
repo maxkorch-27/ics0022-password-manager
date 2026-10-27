@@ -1,6 +1,11 @@
 import getpass
+import os
 import sys
+import shutil
+import subprocess
 from src.accounts import AccountExistsError, authenticate_user, initialize_storage, register_user
+from src.vault import (VaultError, add_entry as save_entry, list_entries as get_entries, get_entry_password,
+                       find_entry as search_entry)
 
 HELP_TEXT = """
 Available commands:
@@ -10,6 +15,7 @@ login - Login to your account
 logout - Logout your account
 add - Add a password entry
 list - List all entries
+copy - Copy an entry password to clipboard
 find - Find password entry by service name
 edit - Edit an existing entry
 remove - Remove a password entry
@@ -28,6 +34,30 @@ def read_bounded_line(prompt, length):
             line = sys.stdin.readline(4096)
         raise ValueError("Input is too long")
     return line.strip()
+
+def copy_to_clipboard(password):
+    if os.environ.get("WSL_DISTRO_NAME"):
+        command = ["clip.exe"]
+    elif sys.platform == "win32":
+        command = ["clip.exe"]
+    elif sys.platform.startswith("linux"):
+        if os.environ.get("WAYLAND_DISPLAY") and shutil.which("wl-copy"):
+            command = ["wl-copy"]
+        elif os.environ.get("DISPLAY") and shutil.which("xclip"):
+            command = ["xclip", "-selection", "clipboard"]
+        else:
+            raise RuntimeError("No supported clipboard utility found.")
+    else:
+        raise RuntimeError("Unsupported operating system.")
+
+    subprocess.run(
+        command,
+        input=password,
+        text=True,
+        check=True,
+        stdout=subprocess.DEVNULL,
+        stderr=subprocess.DEVNULL
+    )
 
 
 class PasswordManagerCLI:
@@ -60,6 +90,7 @@ class PasswordManagerCLI:
             "add": self.add_entry,
             "list": self.list_entries,
             "find": self.find_entry,
+            "copy": self.copy_entry,
             "edit": self.edit_entry,
             "remove": self.remove_entry,
             "lock": self.lock_vault,
@@ -125,13 +156,100 @@ class PasswordManagerCLI:
         print("Logged out.")
 
     def add_entry(self):
-        print ("Adding logic to be added")
+        if self.current_user is None:
+            print("No user is currently logged in.")
+            return
+        if self.vault_key is None:
+            print("Vault is locked. Unlock it first.")
+            return
+
+        service_name = read_bounded_line("Service name: ", 100)
+        if not service_name:
+            print("Service name cannot be empty.")
+            return
+
+        password = getpass.getpass("Entry password: ")
+        if not 1<=len(password)<=256:
+            print("Entry password must be 1-256 characters.")
+            return
+
+        notes = read_bounded_line("Notes: (optional): ", 1000)
+
+        try:
+            save_entry(self.current_user, self.vault_key, service_name, password, notes)
+        except (ValueError, VaultError) as exc:
+            print(f"Failed to save entry: {exc}")
+            return
+        print("Entry saved.")
 
     def list_entries(self):
-        print("List entries logic to be added")
+        if self.current_user is None:
+            print("No user is currently logged in.")
+            return
+        if self.vault_key is None:
+            print("Vault is locked. Unlock it first.")
+            return
+
+        try:
+            services = get_entries(self.current_user, self.vault_key)
+        except VaultError as exc:
+            print(f"Failed to get entries: {exc}")
+            return
+
+        if not services:
+            print("Vault is empty.")
+            return
+        print(f"Saved services ({len(services)}):")
+        for index, service in enumerate(services, start=1):
+            print(f"{index}. {service}")
+
+    def copy_entry(self):
+        if self.current_user is None:
+            print("No user is currently logged in.")
+            return
+        if self.vault_key is None:
+            print("Vault is locked. Unlock it first.")
+            return
+
+        service_name = read_bounded_line("Service name: ", 100)
+        if not service_name or not service_name.strip():
+            print("Service name cannot be empty.")
+            return
+        try:
+            password = get_entry_password(
+                self.current_user,
+                self.vault_key,
+                service_name
+            )
+            copy_to_clipboard(password)
+        except VaultError as exc:
+            print(f"Could not copy password: {exc}")
+            return
+        except (OSError, RuntimeError, subprocess.CalledProcessError):
+            print("Failed to copy password to clipboard.")
+            return
+
+        print("Password copied to clipboard.")
 
     def find_entry(self):
-        print("Find logic to be added")
+        if self.current_user is None:
+            print("No user is currently logged in.")
+            return
+        if self.vault_key is None:
+            print("Vault is locked. Unlock it first.")
+            return
+        service_name = read_bounded_line("Service name: ", 100)
+        if not service_name or not service_name.strip():
+            print("Service name cannot be empty.")
+            return
+        try:
+            entry = search_entry(self.current_user, self.vault_key, service_name)
+        except VaultError as exc:
+            print(f"Failed to find entry: {exc}")
+            return
+        print(f"Service: {entry['service_name']}")
+        print(f"Notes: {entry['notes'] or '(none)'}")
+        print("Password: Use 'copy' command to access password.")
 
     def edit_entry(self):
         print("Editing logic to be added")

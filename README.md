@@ -47,6 +47,7 @@ commands:
 | `remove` | Remove a password entry |
 | `list` | List the user's stored password entries |
 | `find` | Find a specific password entry |
+ |`copy`| Copy the service password into clipboard |
 
 Passwords will be entered using hidden terminal input and will not be provided
 as command-line arguments.
