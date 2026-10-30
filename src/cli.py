@@ -152,9 +152,6 @@ class PasswordManagerCLI:
         self.current_user = None
         print("Logged out. Vault locked.")
 
-        self.current_user = None
-        print("Logged out.")
-
     def add_entry(self):
         if self.current_user is None:
             print("No user is currently logged in.")
@@ -171,6 +168,13 @@ class PasswordManagerCLI:
         password = getpass.getpass("Entry password: ")
         if not 1<=len(password)<=256:
             print("Entry password must be 1-256 characters.")
+            return
+        confirmation = getpass.getpass("Confirm entry password: ")
+        if len(confirmation) > 256:
+            print("Input is too long.")
+            return
+        if password != confirmation:
+            print("Passwords do not match.")
             return
 
         notes = read_bounded_line("Notes: (optional): ", 1000)
@@ -267,12 +271,13 @@ class PasswordManagerCLI:
         if not new_service_name: new_service_name = None
 
         new_password = getpass.getpass("New password (Enter to keep): ")
+        if len(new_password)>256:
+            print("Input is too long.")
+            return
         if not new_password:
             new_password = None
         else:
-            confirm_password = getpass.getpass(
-                "Confirm new password: "
-            )
+            confirm_password = getpass.getpass("Confirm new password: ")
             if new_password != confirm_password:
                 print("Passwords do not match.")
                 return
