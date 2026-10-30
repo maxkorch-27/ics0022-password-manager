@@ -25,4 +25,4 @@ unlocked).
 - `exit`: Exit from application. User logged out and vault locked automatically.
 
 4. Remaining work includes TOTP-based two-factor authentication, additional security testing, improvements to error
-handling and possibly improvements to CLI.
+handling, logging and possibly improvements to CLI.
