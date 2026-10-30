@@ -271,9 +271,6 @@ class PasswordManagerCLI:
         if not new_service_name: new_service_name = None
 
         new_password = getpass.getpass("New password (Enter to keep): ")
-        if len(new_password)>256:
-            print("Input is too long.")
-            return
         if not new_password:
             new_password = None
         else:

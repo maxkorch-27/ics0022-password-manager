@@ -62,11 +62,18 @@ as command-line arguments.
 
 ### Installation
 
-1. Clone the repository and enter the project directory
+1. Clone the repository and enter the project directory:
+```bash
+git clone <repository-url>
+cd ics0022-password-manager
+```
 
-2. Create and activate a virtual environment
-
-3. Install the required dependencies from `requirements.txt` file
+2. Create and activate a virtual environment with requirements:
+```bash
+python3 -m venv .venv
+source .venv/bin/activate
+python3 -m pip install -r requirements.txt
+```
 
 ### Running the Application
 
