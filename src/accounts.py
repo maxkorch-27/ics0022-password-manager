@@ -5,6 +5,7 @@ import os
 import secrets
 import uuid
 from pathlib import Path
+from contextlib import closing
 
 from argon2 import PasswordHasher
 from argon2.exceptions import VerificationError, VerifyMismatchError
@@ -21,6 +22,37 @@ TIME_COST = 3
 MEMORY_COST = 65536
 PARALLELISM = 2
 HASHER = PasswordHasher(time_cost=TIME_COST, memory_cost=MEMORY_COST, parallelism=PARALLELISM)
+
+def check_database_integrity():
+    try:
+        with closing(sqlite3.connect(
+            DB_PATH.as_uri() + "?mode=ro",
+            uri=True
+        )) as db:
+            result = db.execute(
+                "PRAGMA integrity_check"
+            ).fetchall()
+
+    except sqlite3.Error as exc:
+        raise RuntimeError(
+            "Cannot read or verify the database."
+        ) from exc
+
+    if result != [("ok",)]:
+        raise RuntimeError("Database integrity check failed.")
+
+
+def read_account_snapshot(username):
+    with closing(sqlite3.connect(
+        DB_PATH.as_uri() + "?mode=ro",
+        uri=True
+    )) as db:
+        user = db.execute(
+            "SELECT * FROM users WHERE username = ?",
+            (username,)
+        ).fetchone()
+
+    return user
 
 class AccountExistsError(Exception):
     pass
@@ -129,4 +161,4 @@ def authenticate_user(username, master_password):
             AESGCM(dek).decrypt(contents[:12], contents[12:], b'pm-vault-v1:' + user['id'].encode())
         except (InvalidTag, FileNotFoundError, ValueError) as exc:
             raise RuntimeError('Vailt is missing, damaged or cannot be decrypted') from exc
-        return dek
+        return dek, tuple(user)

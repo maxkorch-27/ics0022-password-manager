@@ -1,11 +1,23 @@
 import getpass
 import os
 import sys
+import signal
 import shutil
+import fcntl
+from functools import wraps
+from pathlib import Path
 import subprocess
-from src.accounts import AccountExistsError, authenticate_user, initialize_storage, register_user
 from src.vault import (VaultError, add_entry as save_entry, list_entries as get_entries, get_entry_password,
                        find_entry as search_entry, edit_entry as update_entry, remove_entry as delete_entry)
+import sqlite3
+from src.accounts import (
+    AccountExistsError,
+    authenticate_user,
+    initialize_storage,
+    register_user,
+    check_database_integrity,
+    read_account_snapshot
+)
 
 HELP_TEXT = """
 Available commands:
@@ -23,6 +35,9 @@ lock - Lock the current vault
 unlock - Unlock the current vault
 exit - Exit the application
 """
+DATA_DIR = Path(__file__).resolve().parent.parent / 'data'
+DB_PATH = DATA_DIR / 'users.db'
+VAULT_DIR = DATA_DIR / 'vaults'
 
 def read_bounded_line(prompt, length):
     print(prompt, end="", flush=True)
@@ -65,23 +80,63 @@ class PasswordManagerCLI:
         self.current_user = None
         self.vault_key = None
         self.running = True
+        self.account_snapshot = None
+
+    def clear_session(self):
+        self.vault_key = None
+        self.current_user = None
+        self.account_snapshot = None
+
+    def handle_termination(self, signum, frame):
+        raise SystemExit(128 + signum)
+
+    def check_session_integrity(self):
+        if self.current_user is None:
+            return True
+        try:
+            current = read_account_snapshot(self.current_user)
+        except sqlite3.Error:
+            current = None
+        if self.account_snapshot is None or current != self.account_snapshot:
+            self.clear_session()
+            print("Account database changed or unavailable. Session terminated.")
+            return False
+        return True
 
     def run(self):
+        if os.name == "posix":
+            for sig in (
+                    signal.SIGTERM,
+                    signal.SIGHUP,
+                    signal.SIGQUIT,
+                    signal.SIGTSTP
+            ):
+                signal.signal(sig, self.handle_termination)
+
         print('PASSWORD MANAGER')
         print("Type 'help' to see available commands")
-        while self.running:
-            try:
-                command = read_bounded_line('pm> ', 64).lower()
-                self.handle_command(command)
-            except ValueError as exc:
-                print(exc)
-            except (KeyboardInterrupt, EOFError):
-                print()
-                self.exit_app()
+        try:
+            while self.running:
+                try:
+                    command = read_bounded_line('pm> ', 64).lower()
+                    self.handle_command(command)
+                except ValueError as exc:
+                    print(exc)
+                except (KeyboardInterrupt, EOFError):
+                    print()
+                    break
+        finally:
+            self.clear_session()
+            self.running = False
+            print("Exiting Password Manager")
+
 
     def handle_command(self, command):
         if not command:
             return
+        if self.current_user is not None and command not in ("exit", "logout"):
+            if not self.check_session_integrity():
+                return
         commands = {
             "help": self.show_help,
             "register": self.register,
@@ -132,26 +187,54 @@ class PasswordManagerCLI:
         username = read_bounded_line("Username: ", 32).lower()
         password = getpass.getpass("Master password: ")
         try:
-            dek = authenticate_user(username, password)
+            result = authenticate_user(username, password)
         except RuntimeError as exc:
             print(f"Login failed: {exc}")
             return
-        if dek is None:
+        if result is None:
             print("Invalid username or master password.")
             return
 
+        dek, snapshot = result
         self.current_user = username
         self.vault_key = dek
+        self.account_snapshot = snapshot
         print(f"Logged in as {username}. Vault unlocked.")
 
     def logout(self):
         if self.current_user is None:
             print("No user is currently logged in.")
             return
-        self.vault_key = None
-        self.current_user = None
+        self.clear_session()
         print("Logged out. Vault locked.")
 
+    def locked_vault_write(func):
+        @wraps(func)
+        def wrapper(username, dek, *args, **kwargs):
+            with sqlite3.connect(DB_PATH) as db:
+                user = db.execute(
+                    "SELECT id FROM users WHERE username = ?",
+                    (username,)
+                ).fetchone()
+            if user is None:
+                raise VaultError("User account was not found.")
+            user_id = user[0]
+            lock_path = VAULT_DIR / f"{user_id}.lock"
+            flags = os.O_RDWR | os.O_CREAT | getattr(os, "O_NOFOLLOW", 0)
+            try:
+                fd = os.open(lock_path, flags, 0o600)
+            except OSError as exc:
+                raise VaultError("Could not open vault lock file.") from exc
+
+            with os.fdopen(fd, "r+b") as lock_file:
+                fcntl.flock(lock_file.fileno(), fcntl.LOCK_EX)
+                try:
+                    return func(username, dek, *args, **kwargs)
+                finally:
+                    fcntl.flock(lock_file.fileno(), fcntl.LOCK_UN)
+        return wrapper
+
+    @locked_vault_write
     def add_entry(self):
         if self.current_user is None:
             print("No user is currently logged in.")
@@ -255,6 +338,7 @@ class PasswordManagerCLI:
         print(f"Notes: {entry['notes'] or '(none)'}")
         print("Password: Use 'copy' command to access password.")
 
+    @locked_vault_write
     def edit_entry(self):
         if self.current_user is None:
             print("Please log in first.")
@@ -292,7 +376,7 @@ class PasswordManagerCLI:
         else:
             print("No changes made.")
 
-
+    @locked_vault_write
     def remove_entry(self):
         if self.current_user is None:
             print("Please log in first.")
@@ -338,24 +422,34 @@ class PasswordManagerCLI:
             return
         password = getpass.getpass("Master password: ")
         try:
-            dek = authenticate_user(self.current_user, password)
+            result = authenticate_user(self.current_user, password)
         except RuntimeError as exc:
-            print("Unlock failed: {exc}")
+            print(f"Unlock failed: {exc}")
             return
-        if dek is None:
+        if result is None:
             print("Invalid master password.")
+            return
+        dek, snapshot = result
+        if snapshot != self.account_snapshot:
+            self.clear_session()
+            print("Account data changed. Session terminated.")
             return
         self.vault_key = dek
         print("Vault unlocked.")
 
     def exit_app(self):
-        self.vault_key = None
-        self.current_user = None
         self.running = False
-        print("Exiting Password Manager")
+
 
 def main():
-    initialize_storage()
+    if os.name == "posix":
+        os.umask(0o077)
+    try:
+        initialize_storage()
+        check_database_integrity()
+    except (RuntimeError, sqlite3.Error) as exc:
+        print(f"Startup failed: {exc}")
+        return
     app = PasswordManagerCLI()
     app.run()
 
