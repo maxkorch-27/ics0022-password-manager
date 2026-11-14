@@ -1,5 +1,7 @@
-"""Interactive password manager CLI with structured security audit events."""
 import getpass
+import re
+import pyotp
+import qrcode
 import json
 import os
 import shutil
@@ -11,10 +13,13 @@ import sys
 from src.accounts import (
     AccountExistsError,
     authenticate_user,
+    authenticate_login,
     check_database_integrity,
     initialize_storage,
     read_account_snapshot,
     register_user,
+    validate_registration_input,
+    username_exists
 )
 from src.audit import audit_event, setup_audit_logging
 from src.vault import (
@@ -204,7 +209,9 @@ class PasswordManagerCLI:
             print("Passwords do not match.")
             return
         try:
-            register_user(username, password)
+            validate_registration_input(username, password)
+            if username_exists(username):
+                raise AccountExistsError("Username already exists.")
         except AccountExistsError:
             audit_event("registration", username, "failure", "duplicate_username")
             print("Registration failed.")
@@ -213,13 +220,58 @@ class PasswordManagerCLI:
             audit_event("registration", username, "failure", "invalid_input")
             print("Registration failed: invalid input.")
             return
+        except (sqlite3.Error, OSError):
+            audit_event("registration", username, "failure", "storage_error")
+            print("Registration failed.")
+            return
+
+        secret = pyotp.random_base32()
+        totp = pyotp.TOTP(secret)
+        uri = totp.provisioning_uri(
+            name=username,
+            issuer_name="Local Password Manager",
+        )
+        qr = qrcode.QRCode(
+            error_correction=qrcode.constants.ERROR_CORRECT_L,
+            border=1,
+        )
+        qr.add_data(uri)
+        qr.make(fit=True)
+        print("\nScan this QR code with Microsoft Authenticator or another TOTP app:")
+        qr.print_ascii(invert=True)
+        print("No account will be created until you confirm a code.")
+        confirmed = False
+        for attempt in range(3):
+            code = getpass.getpass("Enter the current 6-digit TOTP code: ")
+            if re.fullmatch(r"[0-9]{6}", code) and totp.verify(code, valid_window=1):
+                confirmed = True
+                break
+            print("Invalid verification code.")
+
+        if not confirmed:
+            audit_event("totp_enrollment", username, "failure", "invalid_credentials")
+            audit_event("registration", username, "failure", "operation_failed")
+            print("Registration cancelled. No account was created.")
+            return
+
+        try:
+            register_user(username, password, secret)
+        except AccountExistsError:
+            audit_event("registration", username, "failure", "duplicate_username")
+            print("Registration failed.")
+            return
+        except ValueError:
+            audit_event("registration", username, "failure", "invalid_input")
+            print("Registration failed.")
+            return
+
         except (OSError, sqlite3.Error):
             audit_event("registration", username, "failure", "storage_error")
             print("Registration failed.")
             return
+        audit_event("totp_enrollment", username)
         audit_event("registration", username)
         print("Account successfully created.")
-        # TOTP logic to be added
 
     def login(self):
         if self.current_user is not None:
@@ -227,15 +279,16 @@ class PasswordManagerCLI:
             return
         username = read_bounded_line("Username: ", 32).lower()
         password = getpass.getpass("Master password: ")
+        code = getpass.getpass("TOTP code: ")
         try:
-            result = authenticate_user(username, password)
+            result = authenticate_login(username, password, code)
         except (RuntimeError, sqlite3.Error, OSError):
             audit_event("login", username, "failure", "authentication_error")
             print("Login failed.")
             return
         if result is None:
             audit_event("login", username, "failure", "invalid_credentials")
-            print("Invalid username or master password.")
+            print("Invalid credentials or temporarily unavailable. Try again later.")
             return
 
         dek, snapshot = result

@@ -1,4 +1,3 @@
-"""Structured security audit events. No secret or free-form exception values."""
 import json
 import logging
 import os
@@ -11,7 +10,7 @@ from src.accounts import DATA_DIR
 LOG_PATH = DATA_DIR / "audit.jsonl"
 USERNAME_RE = re.compile(r"[a-z0-9_]{3,32}\Z")
 EVENTS = {
-    "registration", "login", "logout", "vault_lock", "vault_unlock",
+    "registration", "totp_enrollment", "login", "logout", "vault_lock", "vault_unlock",
     "entry_add", "entry_list", "entry_find", "entry_copy", "entry_edit",
     "entry_remove", "integrity_failure", "session_end", "input_rejected",
     "unexpected_error",
@@ -46,8 +45,6 @@ def setup_audit_logging():
     logger = logging.getLogger("password_manager.audit")
     if logger.handlers:
         return
-
-    # DATA_DIR must have already been created by initialize_storage().
     flags = os.O_WRONLY | os.O_CREAT | os.O_APPEND | getattr(os, "O_NOFOLLOW", 0)
     fd = os.open(LOG_PATH, flags, 0o600)
     try:
