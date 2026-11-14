@@ -5,6 +5,8 @@ import sqlite3
 import tempfile
 import uuid
 from pathlib import Path
+import fcntl
+from functools import wraps
 
 from cryptography.exceptions import InvalidTag
 from cryptography.hazmat.primitives.ciphers.aead import AESGCM
@@ -89,6 +91,36 @@ def save_vault(document, user_id, dek):
         if tmp_path is not None:
             tmp_path.unlink(missing_ok=True)
 
+def locked_vault_write(func):
+    @wraps(func)
+    def wrapper(username, dek, *args, **kwargs):
+        with sqlite3.connect(DB_PATH) as db:
+            user = db.execute(
+                "SELECT id FROM users WHERE username = ?",
+                (username,)
+            ).fetchone()
+        if user is None:
+            raise VaultError("User account not found.")
+        user_id = user[0]
+        lock_path = VAULT_DIR / f"{user_id}.lock"
+        flags = (
+            os.O_RDWR
+            | os.O_CREAT
+            | getattr(os, "O_NOFOLLOW", 0)
+        )
+        try:
+            fd = os.open(lock_path, flags, 0o600)
+            with os.fdopen(fd, "r+b") as lock_file:
+                fcntl.flock(lock_file.fileno(), fcntl.LOCK_EX)
+                try:
+                    return func(username, dek, *args, **kwargs)
+                finally:
+                    fcntl.flock(lock_file.fileno(), fcntl.LOCK_UN)
+        except OSError as exc:
+            raise VaultError("Vault locking failed.") from exc
+    return wrapper
+
+@locked_vault_write
 def add_entry(username, dek, service_name, password, notes):
     if not 1 <= len(service_name) <= 100 or not service_name.strip():
         raise ValueError("Service name must be 1-100 characters.")
@@ -166,6 +198,7 @@ def find_entry(username, dek, service_name):
             }
     raise VaultError("Entry not found.")
 
+@locked_vault_write
 def edit_entry(username, dek, service_name, new_service_name=None, new_password=None, new_notes=None):
     document, user_id = load_vault(username, dek)
     normalized_name = service_name.strip().casefold()
@@ -207,6 +240,7 @@ def edit_entry(username, dek, service_name, new_service_name=None, new_password=
     save_vault(document, user_id, dek)
     return True
 
+@locked_vault_write
 def remove_entry(username, dek, service_name):
     document, user_id = load_vault(username, dek)
     normalized_name = service_name.strip().casefold()

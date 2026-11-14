@@ -1,22 +1,30 @@
+"""Interactive password manager CLI with structured security audit events."""
 import getpass
+import json
 import os
-import sys
-import signal
 import shutil
-import fcntl
-from functools import wraps
-from pathlib import Path
-import subprocess
-from src.vault import (VaultError, add_entry as save_entry, list_entries as get_entries, get_entry_password,
-                       find_entry as search_entry, edit_entry as update_entry, remove_entry as delete_entry)
+import signal
 import sqlite3
+import subprocess
+import sys
+
 from src.accounts import (
     AccountExistsError,
     authenticate_user,
-    initialize_storage,
-    register_user,
     check_database_integrity,
-    read_account_snapshot
+    initialize_storage,
+    read_account_snapshot,
+    register_user,
+)
+from src.audit import audit_event, setup_audit_logging
+from src.vault import (
+    VaultError,
+    add_entry as save_entry,
+    edit_entry as update_entry,
+    find_entry as search_entry,
+    get_entry_password,
+    list_entries as get_entries,
+    remove_entry as delete_entry,
 )
 
 HELP_TEXT = """
@@ -35,25 +43,26 @@ lock - Lock the current vault
 unlock - Unlock the current vault
 exit - Exit the application
 """
-DATA_DIR = Path(__file__).resolve().parent.parent / 'data'
-DB_PATH = DATA_DIR / 'users.db'
-VAULT_DIR = DATA_DIR / 'vaults'
+
 
 def read_bounded_line(prompt, length):
     print(prompt, end="", flush=True)
-    line = sys.stdin.readline(length+2)
+    line = sys.stdin.readline(length + 2)
     if line == "":
         raise EOFError
     if len(line.rstrip("\r\n")) > length:
         while line and not line.endswith("\n"):
             line = sys.stdin.readline(4096)
-        raise ValueError("Input is too long")
+        raise ValueError("Input is too long.")
     return line.strip()
 
+
+def display_text(value):
+    return json.dumps(value, ensure_ascii=True)
+
+
 def copy_to_clipboard(password):
-    if os.environ.get("WSL_DISTRO_NAME"):
-        command = ["clip.exe"]
-    elif sys.platform == "win32":
+    if os.environ.get("WSL_DISTRO_NAME") or sys.platform == "win32":
         command = ["clip.exe"]
     elif sys.platform.startswith("linux"):
         if os.environ.get("WAYLAND_DISPLAY") and shutil.which("wl-copy"):
@@ -71,7 +80,7 @@ def copy_to_clipboard(password):
         text=True,
         check=True,
         stdout=subprocess.DEVNULL,
-        stderr=subprocess.DEVNULL
+        stderr=subprocess.DEVNULL,
     )
 
 
@@ -79,8 +88,9 @@ class PasswordManagerCLI:
     def __init__(self):
         self.current_user = None
         self.vault_key = None
-        self.running = True
         self.account_snapshot = None
+        self.running = True
+        self.exit_reason = "terminated"
 
     def clear_session(self):
         self.vault_key = None
@@ -88,48 +98,68 @@ class PasswordManagerCLI:
         self.account_snapshot = None
 
     def handle_termination(self, signum, frame):
+        self.exit_reason = "terminated"
         raise SystemExit(128 + signum)
+
+    def require_unlocked(self, event):
+        if self.current_user is None:
+            audit_event(event, outcome="denied", reason="not_authenticated")
+            print("Please log in first.")
+            return False
+        if self.vault_key is None:
+            audit_event(event, self.current_user, "denied", "vault_locked")
+            print("Vault is locked. Use unlock first.")
+            return False
+        return True
 
     def check_session_integrity(self):
         if self.current_user is None:
             return True
         try:
             current = read_account_snapshot(self.current_user)
-        except sqlite3.Error:
+        except (sqlite3.Error, OSError):
             current = None
+
         if self.account_snapshot is None or current != self.account_snapshot:
+            audit_event("integrity_failure", self.current_user, "failure", "account_changed")
             self.clear_session()
-            print("Account database changed or unavailable. Session terminated.")
+            print("Session ended due to an integrity error.")
             return False
         return True
 
     def run(self):
         if os.name == "posix":
-            for sig in (
-                    signal.SIGTERM,
-                    signal.SIGHUP,
-                    signal.SIGQUIT,
-                    signal.SIGTSTP
-            ):
+            for sig in (signal.SIGTERM, signal.SIGHUP, signal.SIGQUIT, signal.SIGTSTP):
                 signal.signal(sig, self.handle_termination)
 
-        print('PASSWORD MANAGER')
+        print("PASSWORD MANAGER")
         print("Type 'help' to see available commands")
         try:
             while self.running:
                 try:
-                    command = read_bounded_line('pm> ', 64).lower()
+                    command = read_bounded_line("pm> ", 64).lower()
                     self.handle_command(command)
-                except ValueError as exc:
-                    print(exc)
-                except (KeyboardInterrupt, EOFError):
+                except ValueError:
+                    audit_event("input_rejected", self.current_user, "denied", "invalid_input")
+                    print("Invalid or oversized input.")
+                except KeyboardInterrupt:
+                    self.exit_reason = "interrupted"
                     print()
                     break
+                except EOFError:
+                    self.exit_reason = "eof"
+                    print()
+                    break
+                except Exception:
+                    audit_event("unexpected_error", self.current_user, "failure", "unexpected_error")
+                    self.clear_session()
+                    print("Operation failed. Session ended.")
         finally:
+            if self.current_user is not None:
+                audit_event("session_end", self.current_user, "success", self.exit_reason)
             self.clear_session()
             self.running = False
             print("Exiting Password Manager")
-
 
     def handle_command(self, command):
         if not command:
@@ -154,7 +184,7 @@ class PasswordManagerCLI:
         }
         action = commands.get(command)
         if action is None:
-            print("Unknown command. Type 'help' to see available commands")
+            print("Unknown command. Type 'help' to see available commands.")
             return
         action()
 
@@ -163,22 +193,33 @@ class PasswordManagerCLI:
 
     def register(self):
         if self.current_user is not None:
+            audit_event("registration", self.current_user, "denied", "operation_failed")
             print("Log out before registering another user.")
             return
-
         username = read_bounded_line("Username: ", 32).lower()
         password = getpass.getpass("Master password: ")
         confirmation = getpass.getpass("Confirm master password: ")
         if password != confirmation:
+            audit_event("registration", username, "failure", "password_mismatch")
             print("Passwords do not match.")
             return
         try:
             register_user(username, password)
-        except (AccountExistsError, ValueError) as exc:
-            print(f"Registration failed: {exc}")
+        except AccountExistsError:
+            audit_event("registration", username, "failure", "duplicate_username")
+            print("Registration failed.")
             return
+        except ValueError:
+            audit_event("registration", username, "failure", "invalid_input")
+            print("Registration failed: invalid input.")
+            return
+        except (OSError, sqlite3.Error):
+            audit_event("registration", username, "failure", "storage_error")
+            print("Registration failed.")
+            return
+        audit_event("registration", username)
         print("Account successfully created.")
-        #TOTP logic to be added
+        # TOTP logic to be added
 
     def login(self):
         if self.current_user is not None:
@@ -188,10 +229,12 @@ class PasswordManagerCLI:
         password = getpass.getpass("Master password: ")
         try:
             result = authenticate_user(username, password)
-        except RuntimeError as exc:
-            print(f"Login failed: {exc}")
+        except (RuntimeError, sqlite3.Error, OSError):
+            audit_event("login", username, "failure", "authentication_error")
+            print("Login failed.")
             return
         if result is None:
+            audit_event("login", username, "failure", "invalid_credentials")
             print("Invalid username or master password.")
             return
 
@@ -199,219 +242,178 @@ class PasswordManagerCLI:
         self.current_user = username
         self.vault_key = dek
         self.account_snapshot = snapshot
+        audit_event("login", username)
         print(f"Logged in as {username}. Vault unlocked.")
 
     def logout(self):
         if self.current_user is None:
             print("No user is currently logged in.")
             return
+        username = self.current_user
         self.clear_session()
+        audit_event("logout", username)
         print("Logged out. Vault locked.")
 
-    def locked_vault_write(func):
-        @wraps(func)
-        def wrapper(username, dek, *args, **kwargs):
-            with sqlite3.connect(DB_PATH) as db:
-                user = db.execute(
-                    "SELECT id FROM users WHERE username = ?",
-                    (username,)
-                ).fetchone()
-            if user is None:
-                raise VaultError("User account was not found.")
-            user_id = user[0]
-            lock_path = VAULT_DIR / f"{user_id}.lock"
-            flags = os.O_RDWR | os.O_CREAT | getattr(os, "O_NOFOLLOW", 0)
-            try:
-                fd = os.open(lock_path, flags, 0o600)
-            except OSError as exc:
-                raise VaultError("Could not open vault lock file.") from exc
-
-            with os.fdopen(fd, "r+b") as lock_file:
-                fcntl.flock(lock_file.fileno(), fcntl.LOCK_EX)
-                try:
-                    return func(username, dek, *args, **kwargs)
-                finally:
-                    fcntl.flock(lock_file.fileno(), fcntl.LOCK_UN)
-        return wrapper
-
-    @locked_vault_write
     def add_entry(self):
-        if self.current_user is None:
-            print("No user is currently logged in.")
+        if not self.require_unlocked("entry_add"):
             return
-        if self.vault_key is None:
-            print("Vault is locked. Unlock it first.")
-            return
-
         service_name = read_bounded_line("Service name: ", 100)
         if not service_name:
+            audit_event("entry_add", self.current_user, "failure", "invalid_input")
             print("Service name cannot be empty.")
             return
-
         password = getpass.getpass("Entry password: ")
-        if not 1<=len(password)<=256:
+        if not 1 <= len(password) <= 256:
+            audit_event("entry_add", self.current_user, "failure", "invalid_input")
             print("Entry password must be 1-256 characters.")
             return
         confirmation = getpass.getpass("Confirm entry password: ")
-        if len(confirmation) > 256:
-            print("Input is too long.")
-            return
         if password != confirmation:
+            audit_event("entry_add", self.current_user, "failure", "password_mismatch")
             print("Passwords do not match.")
             return
-
-        notes = read_bounded_line("Notes: (optional): ", 1000)
-
+        notes = read_bounded_line("Notes (optional): ", 1000)
         try:
             save_entry(self.current_user, self.vault_key, service_name, password, notes)
-        except (ValueError, VaultError) as exc:
-            print(f"Failed to save entry: {exc}")
+        except (ValueError, VaultError):
+            audit_event("entry_add", self.current_user, "failure", "operation_failed")
+            print("Failed to add entry.")
             return
+        audit_event("entry_add", self.current_user)
         print("Entry saved.")
 
     def list_entries(self):
-        if self.current_user is None:
-            print("No user is currently logged in.")
+        if not self.require_unlocked("entry_list"):
             return
-        if self.vault_key is None:
-            print("Vault is locked. Unlock it first.")
-            return
-
         try:
             services = get_entries(self.current_user, self.vault_key)
-        except VaultError as exc:
-            print(f"Failed to get entries: {exc}")
+        except VaultError:
+            audit_event("entry_list", self.current_user, "failure", "operation_failed")
+            print("Failed to list entries.")
             return
-
+        audit_event("entry_list", self.current_user)
         if not services:
             print("Vault is empty.")
             return
         print(f"Saved services ({len(services)}):")
         for index, service in enumerate(services, start=1):
-            print(f"{index}. {service}")
-
-    def copy_entry(self):
-        if self.current_user is None:
-            print("No user is currently logged in.")
-            return
-        if self.vault_key is None:
-            print("Vault is locked. Unlock it first.")
-            return
-
-        service_name = read_bounded_line("Service name: ", 100)
-        if not service_name or not service_name.strip():
-            print("Service name cannot be empty.")
-            return
-        try:
-            password = get_entry_password(
-                self.current_user,
-                self.vault_key,
-                service_name
-            )
-            copy_to_clipboard(password)
-        except VaultError as exc:
-            print(f"Could not copy password: {exc}")
-            return
-        except (OSError, RuntimeError, subprocess.CalledProcessError):
-            print("Failed to copy password to clipboard.")
-            return
-
-        print("Password copied to clipboard.")
+            print(f"{index}. {display_text(service)}")
 
     def find_entry(self):
-        if self.current_user is None:
-            print("No user is currently logged in.")
-            return
-        if self.vault_key is None:
-            print("Vault is locked. Unlock it first.")
+        if not self.require_unlocked("entry_find"):
             return
         service_name = read_bounded_line("Service name: ", 100)
-        if not service_name or not service_name.strip():
+        if not service_name:
+            audit_event("entry_find", self.current_user, "failure", "invalid_input")
             print("Service name cannot be empty.")
             return
         try:
             entry = search_entry(self.current_user, self.vault_key, service_name)
-        except VaultError as exc:
-            print(f"Failed to find entry: {exc}")
+        except VaultError:
+            audit_event("entry_find", self.current_user, "failure", "operation_failed")
+            print("Entry not found or vault could not be read.")
             return
-        print(f"Service: {entry['service_name']}")
-        print(f"Notes: {entry['notes'] or '(none)'}")
+        audit_event("entry_find", self.current_user)
+        print(f"Service: {display_text(entry['service_name'])}")
+        print(f"Notes: {display_text(entry['notes']) if entry['notes'] else '(none)'}")
         print("Password: Use 'copy' command to access password.")
 
-    @locked_vault_write
-    def edit_entry(self):
-        if self.current_user is None:
-            print("Please log in first.")
+    def copy_entry(self):
+        if not self.require_unlocked("entry_copy"):
             return
-        if self.vault_key is None:
-            print("Vault is locked. Use unlock first.")
-            return
-
-        service_name = read_bounded_line("Service name to edit: ", 100)
-        if not service_name or not service_name.strip():
+        service_name = read_bounded_line("Service name: ", 100)
+        if not service_name:
+            audit_event("entry_copy", self.current_user, "failure", "invalid_input")
             print("Service name cannot be empty.")
             return
-        new_service_name = read_bounded_line("New service name (Enter to keep): ", 100)
-        if not new_service_name: new_service_name = None
+        password = None
+        try:
+            password = get_entry_password(self.current_user, self.vault_key, service_name)
+            copy_to_clipboard(password)
+        except VaultError:
+            audit_event("entry_copy", self.current_user, "failure", "operation_failed")
+            print("Could not retrieve password.")
+            return
+        except (OSError, RuntimeError, subprocess.CalledProcessError):
+            audit_event("entry_copy", self.current_user, "failure", "clipboard_unavailable")
+            print("Could not copy password to clipboard.")
+            return
+        finally:
+            password = None
+        audit_event("entry_copy", self.current_user)
+        print("Password copied to clipboard.")
 
-        new_password = getpass.getpass("New password (Enter to keep): ")
-        if not new_password:
-            new_password = None
-        else:
-            confirm_password = getpass.getpass("Confirm new password: ")
-            if new_password != confirm_password:
+    def edit_entry(self):
+        if not self.require_unlocked("entry_edit"):
+            return
+        service_name = read_bounded_line("Service name to edit: ", 100)
+        if not service_name:
+            audit_event("entry_edit", self.current_user, "failure", "invalid_input")
+            print("Service name cannot be empty.")
+            return
+        new_service_name = read_bounded_line("New service name (Enter to keep): ", 100) or None
+        new_password = getpass.getpass("New password (Enter to keep): ") or None
+        if new_password is not None:
+            confirmation = getpass.getpass("Confirm new password: ")
+            if new_password != confirmation:
+                audit_event("entry_edit", self.current_user, "failure", "password_mismatch")
                 print("Passwords do not match.")
                 return
         new_notes = read_bounded_line("New notes (Enter to keep, '/clear' to remove): ", 1000)
-        if new_notes=="": new_notes = None
+        if new_notes == "":
+            new_notes = None
         elif new_notes == "/clear":
             new_notes = ""
         try:
-            changed = update_entry(self.current_user, self.vault_key, service_name, new_service_name, new_password, new_notes)
-        except (ValueError, VaultError) as exc:
-            print(f"Failed to edit entry: {exc}")
+            changed = update_entry(
+                self.current_user, self.vault_key, service_name,
+                new_service_name, new_password, new_notes,
+            )
+        except (VaultError, ValueError):
+            audit_event("entry_edit", self.current_user, "failure", "operation_failed")
+            print("Failed to edit entry.")
             return
         if changed:
+            audit_event("entry_edit", self.current_user)
             print("Entry updated successfully.")
         else:
+            audit_event("entry_edit", self.current_user, "success", "no_changes")
             print("No changes made.")
 
-    @locked_vault_write
     def remove_entry(self):
-        if self.current_user is None:
-            print("Please log in first.")
+        if not self.require_unlocked("entry_remove"):
             return
-        if self.vault_key is None:
-            print("Vault is locked. Use unlock first.")
-            return
-
         service_name = read_bounded_line("Service name to remove: ", 100)
-        if not service_name or not service_name.strip():
+        if not service_name:
+            audit_event("entry_remove", self.current_user, "failure", "invalid_input")
             print("Service name cannot be empty.")
             return
         confirmation = read_bounded_line(
-            f"Are you sure you want to remove {service_name!r}? (yes/no): ",
-            3
+            f"Are you sure you want to remove {display_text(service_name)}? (yes/no): ", 3
         )
-        if confirmation.strip().casefold() != "yes":
+        if confirmation.casefold() != "yes":
+            audit_event("entry_remove", self.current_user, "denied", "cancelled")
             print("Removal cancelled.")
             return
         try:
             delete_entry(self.current_user, self.vault_key, service_name)
-        except (VaultError, ValueError) as exc:
-            print(f"Failed to remove entry: {exc}")
+        except (VaultError, ValueError):
+            audit_event("entry_remove", self.current_user, "failure", "operation_failed")
+            print("Failed to remove entry.")
             return
+        audit_event("entry_remove", self.current_user)
         print("Removal successful.")
 
     def lock_vault(self):
         if self.current_user is None:
             print("Log in first to lock vault.")
             return
-        elif self.vault_key is None:
+        if self.vault_key is None:
             print("Vault is already locked.")
-        else:
-            self.vault_key = None
-            print("Vault locked.")
+            return
+        self.vault_key = None
+        audit_event("vault_lock", self.current_user)
+        print("Vault locked.")
 
     def unlock_vault(self):
         if self.current_user is None:
@@ -423,21 +425,26 @@ class PasswordManagerCLI:
         password = getpass.getpass("Master password: ")
         try:
             result = authenticate_user(self.current_user, password)
-        except RuntimeError as exc:
-            print(f"Unlock failed: {exc}")
+        except (RuntimeError, sqlite3.Error, OSError):
+            audit_event("vault_unlock", self.current_user, "failure", "authentication_error")
+            print("Unlock failed.")
             return
         if result is None:
+            audit_event("vault_unlock", self.current_user, "failure", "invalid_credentials")
             print("Invalid master password.")
             return
         dek, snapshot = result
         if snapshot != self.account_snapshot:
+            audit_event("integrity_failure", self.current_user, "failure", "account_changed")
             self.clear_session()
-            print("Account data changed. Session terminated.")
+            print("Session ended due to an integrity error.")
             return
         self.vault_key = dek
+        audit_event("vault_unlock", self.current_user)
         print("Vault unlocked.")
 
     def exit_app(self):
+        self.exit_reason = "terminated"
         self.running = False
 
 
@@ -446,12 +453,20 @@ def main():
         os.umask(0o077)
     try:
         initialize_storage()
+        setup_audit_logging()
+    except (OSError, RuntimeError, sqlite3.Error):
+        # Auditing may not be available yet.
+        print("Application initialization failed.")
+        return
+    try:
         check_database_integrity()
-    except (RuntimeError, sqlite3.Error) as exc:
-        print(f"Startup failed: {exc}")
+    except (OSError, RuntimeError, sqlite3.Error):
+        audit_event("integrity_failure", outcome="failure", reason="database_check_failed")
+        print("Application initialization failed.")
         return
     app = PasswordManagerCLI()
     app.run()
+
 
 if __name__ == "__main__":
     main()
