@@ -43,7 +43,7 @@ class JsonAuditFormatter(logging.Formatter):
 
 def setup_audit_logging():
     logger = logging.getLogger("password_manager.audit")
-    if logger.handlers:
+    if any(isinstance(handler.formatter, JsonAuditFormatter) for handler in logger.handlers):
         return
     flags = os.O_WRONLY | os.O_CREAT | os.O_APPEND | getattr(os, "O_NOFOLLOW", 0)
     fd = os.open(LOG_PATH, flags, 0o600)

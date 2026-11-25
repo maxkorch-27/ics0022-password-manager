@@ -122,8 +122,8 @@ def locked_vault_write(func):
 
 @locked_vault_write
 def add_entry(username, dek, service_name, password, notes):
-    if not 1 <= len(service_name) <= 100 or not service_name.strip():
-        raise ValueError("Service name must be 1-100 characters.")
+    if not 1 <= len(service_name) <= 100 or not service_name.strip() or not service_name.isprintable():
+        raise ValueError("Invalid service name.")
     if not 1 <= len(password) <= 256:
         raise ValueError("Entry password must be 1-256 characters.")
     if len(notes) > 1000:
@@ -217,13 +217,14 @@ def edit_entry(username, dek, service_name, new_service_name=None, new_password=
     if target_entry is None:
         raise VaultError("Entry not found.")
     if new_service_name is not None:
-        new_service_name = new_service_name.strip().casefold()
-        if not 1 <= len(new_service_name) <= 100:
-            raise ValueError("New service name must be 1-100 characters.")
+        new_service_name = new_service_name.strip()
+        if not 1 <= len(new_service_name) <= 100 or not new_service_name.strip() or not new_service_name.isprintable():
+            raise ValueError("Invalid service name.")
+        normalized_new_name = new_service_name.casefold()
         for entry in document["entries"]:
             if entry is target_entry:
                 continue
-            if entry["service_name"].strip().casefold() == new_service_name.casefold():
+            if entry["service_name"].strip().casefold() == normalized_new_name:
                 raise VaultError("Service name already exists.")
         target_entry["service_name"] = new_service_name
     if new_password is not None:
